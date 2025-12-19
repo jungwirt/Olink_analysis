@@ -1,0 +1,267 @@
+---
+title: "Olink Proteomics Intro analyses in R"
+author: "Maks Necki"
+date: "2025-12-16"
+output: html_document
+---
+
+Installation of required packages
+```{r}
+#install.packages("nloptr")
+#install.packages("lme4")
+#install.packages("pbkrtest")
+#install.packages("car")
+#install.packages("rstatix")
+#install.packages("ggpubr")
+#install.packages("OlinkAnalyze")
+#install.packages("readxl")
+#install.packages("FactoMineR")
+#install.packages("factoextra")
+```
+
+Loading required libraries
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(OlinkAnalyze)
+library(readr)
+library(readxl)
+library(FactoMineR)
+library(factoextra)
+```
+
+Importing dataset and selecting relevant columns for analysis:
+
+```{r}
+df_olink <- OlinkAnalyze::read_NPX("/mnt/dysk_D/Olink_Gdansk/Result-X204SC25109867-Z01-F002-B1-43/Allsamples_prequant_v2.csv") 
+
+df_mod <- df_olink %>% 
+select(SampleID, SampleType, WellID, UniProt, Assay, AssayType, Count, ExtNPX, NPX, PCNormalizedNPX, AssayQC, SampleQC, IntraCV, InterCV, SampleBlockQCWarn, SampleBlockQCFail, BlockQCFail, AssayQCWarn)
+
+head(df_mod)
+```
+
+Check data completness:
+
+```{r}
+# If there is no value returned, it means dataset is OK!
+OlinkAnalyze:::check_data_completeness(df_olink)
+```
+
+Importing validation dataset (don't know if it will be useful):
+
+```{r}
+df_val <- read_excel("/mnt/dysk_D/Olink_Gdansk/olink-Reveal-validation-data.xlsx", sheet = "Data", skip = 1) 
+```
+
+Assessing QC status of assays and samples:
+
+```{r}
+table(df_mod$AssayQC)
+table(df_mod$SampleQC)
+```
+
+Preparing data for plotting and further analyzes:
+```{r}
+df_plot <- df_olink %>%
+  mutate(QC_Warning = AssayQCWarn == 1)
+```
+
+
+```{r}
+df_plot <- df_plot %>%
+  mutate(SampleGroup = NA_character_) %>%
+  mutate(SampleGroup = ifelse(grepl("^K", SampleID), "control", SampleGroup)) %>%
+  mutate(SampleGroup = ifelse(grepl("^NC", SampleID), "negative control", SampleGroup)) %>%
+  mutate(SampleGroup = ifelse(grepl("^PC", SampleID), "plate control", SampleGroup)) %>%
+  mutate(SampleGroup = ifelse(grepl("^SC", SampleID), "sample control", SampleGroup)) %>%
+  mutate(SampleGroup = ifelse(grepl("^P.*W1$", SampleID), "before treatment", SampleGroup)) %>%
+  mutate(SampleGroup = ifelse(grepl("^P.*W2$", SampleID), "after 1 month treatment", SampleGroup)) %>%
+  mutate(SampleGroup = ifelse(grepl("^P.*W3$", SampleID), "after 3 month treatment", SampleGroup)) %>%
+  mutate(SampleGroup = ifelse(is.na(SampleGroup), "other", SampleGroup))
+```
+
+
+Visualizing distribution of NPX values for our samples:
+
+```{r}
+olink_dist_plot(df_plot %>% filter(Panel == 'Reveal')) + 
+theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+scale_fill_manual(values = c('turquoise3', 'red'))
+```
+
+Visualising potential outliers by IQR vs. sample median:
+
+```{r}
+olink_qc_plot(df_plot %>% filter(Panel == 'Reveal')) +
+  scale_color_manual(values = c('turquoise3', 'red'))
+```
+
+As wee see, all samples pass QC in terms of NPX distribution. First samples seen on plot above were flagged as warnings but they were controls.
+Nevertheless, to be 1000% save we will filter our dataset to include only samples and assays that passed QC:
+
+```{r}
+df_bio <- df_plot %>%
+  filter(AssayType == "assay")
+
+df_qc <- df_bio %>%
+  dplyr::filter(SampleQC == "PASS", AssayQC == "PASS")
+
+dim(df_qc); sum(is.na(df_qc$NPX))
+```
+
+Checking wether ExtNPX, NPX and PCNormalizedNPX distributions are normal: 
+```{r}
+library(tidyr)
+
+# Tworzymy df_long z kolumną SampleGroup
+df_long <- df_qc %>%
+  select(SampleGroup, NPX, ExtNPX, PCNormalizedNPX) %>%
+  pivot_longer(cols = c(NPX, ExtNPX, PCNormalizedNPX), names_to = "variable", values_to = "value")
+
+# Rysujemy histogramy dla każdej zmiennej i grupy
+ggplot(df_long, aes(x = value, fill = variable)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity", color = "black") +
+  facet_grid(SampleGroup ~ variable, scales = "free") +  # osobne wiersze dla grup
+  theme_minimal() +
+  labs(title = "Histogramy NPX, ExtNPX i PCNormalizedNPX według grup", x = "Wartość",y = "Liczba próbek") +
+  scale_fill_manual(values = c("turquoise3", "goldenrod2", "tomato3"))
+
+```
+
+Selecting columns for analyzes, now we have samples as rows and proteins as columns:
+
+```{r}
+df_matrix <- df_qc %>% 
+    select(SampleID, UniProt, NPX) %>%
+    tidyr::pivot_wider(names_from = UniProt, values_from = NPX)
+
+head(df_matrix)
+
+```
+
+We will do PCA with names of samples on a plot (to spot potential outliers with ease this way):
+
+```{r}
+df_matrix2 <- df_matrix
+rownames(df_matrix2) <- df_matrix2$SampleID # we must set rownames to sample IDs to visualize straightly them on PCA plot
+
+pca_res_2 <- PCA(df_matrix2[,-1], scale.unit = TRUE, graph = FALSE)
+rownames(pca_res_2$ind$coord) <- df_matrix2$SampleID
+
+fviz_pca_ind(pca_res_2, geom.ind = "point", label = "all",repel = TRUE)
+
+```
+
+As we can see, there are no obvious outliers in our dataset. The most two estreme points are two negative controls (which is expected). Here's another way of visualizing potential outliers using OlinkAnalyze function:
+
+```{r}
+df_qc %>% 
+    olink_pca_plot(color_g = "SampleGroup", outlierDefX = 3, outlierDefY = 3, outlierLines = TRUE, label_outliers = TRUE) 
+
+```
+
+1. Selecting first comparison: control vs. before treatment
+
+```{r}
+df_subs <- df_qc %>%
+  filter(SampleGroup %in% c("control", "before treatment"))
+```
+
+2. Each sample is measured only once (one hole measurement). But it's like checking one human for 96 different illnesses. We can't say that there are 96 humans there!
+
+```{r}
+ggplot(df_subs, aes(sample = NPX)) +
+  stat_qq() +
+  stat_qq_line() +
+  facet_wrap(~SampleGroup)
+```
+
+3. Checking group sizes:
+
+```{r}
+df_subs %>%
+  dplyr::distinct(SampleID, SampleGroup) %>%
+  dplyr::count(SampleGroup)
+```
+
+4. Performing differential expression analysis using Welch t-test:
+
+```{r}
+ttest_results <- olink_ttest(df = df_subs, variable = "SampleGroup")
+```
+
+
+
+Selecting top 10 differentially expressed proteins based on adjusted p-value:
+```{r}
+top10_fdr <- ttest_results %>%
+  arrange(Adjusted_pval) %>%
+  head(10) %>%
+  pull(OlinkID)
+```
+
+Creating volcano plot to visualize differential expression results:
+```{r volcano plot, fig.width=12, fig.height=10}
+olink_volcano_plot(p.val_tbl = ttest_results, olinkid_list = top10_fdr) +
+  scale_color_manual(values = c('turquoise3', 'red')) +
+  theme_minimal() +
+  labs(title = "Volcano plot: before treatment vs control", x = "Difference in NPX (Estimate)",y = "-log10(p-value)")
+```
+
+
+We will do the same analysis but for after 1 month of treatment vs. before treatment samples:
+
+```{r}
+df_subs_2 <- df_qc %>%
+  filter(SampleGroup %in% c("before treatment", "after 1 month treatment"))
+
+
+df_subs_2_filtered <- df_subs_2 %>%
+  filter(SampleGroup %in% c("before treatment", "after 1 month treatment")) %>%
+  mutate(PairID = sub("W[12]$", "", SampleID))  # tworzymy identyfikator pary tylko dla W1 i W2
+# Upewnij się, że masz kolumnę identyfikującą próbki pacjentów, np. SampleID
+# Paired test (sparowane próbki)
+ttest_results_2 <- olink_ttest(df_subs_2_filtered, variable = "SampleGroup", pair_id = "PairID")
+
+# Weź 20 najbardziej istotnych białek
+top20_fdr_2 <- ttest_results_2 %>%
+  arrange(Adjusted_pval) %>%
+  slice(1:20) %>%
+  pull(OlinkID)
+
+# Volcano plot
+olink_volcano_plot(p.val_tbl = ttest_results_2, olinkid_list = top20_fdr_2) +
+  scale_color_manual(values = c('turquoise3', 'red')) +
+  theme_minimal() +
+  labs(title = "Volcano plot: before vs 1 month after treatment", x = "Difference in NPX (Estimate)",y = "-log10(p-value)")
+
+```
+
+And for samples before treatment vs. after 3 months of treatment:
+
+```{r}
+df_subs_3 <- df_qc %>%
+  filter(SampleGroup %in% c("before treatment", "after 3 month treatment"))
+
+
+df_subs_3_filtered <- df_subs_3 %>%
+  filter(SampleGroup %in% c("before treatment", "after 3 month treatment")) %>%
+  mutate(PairID = sub("W[13]$", "", SampleID))
+# Upewnij się, że masz kolumnę identyfikującą próbki pacjentów, np. SampleID
+# Paired test (sparowane próbki)
+ttest_results_3 <- olink_ttest(df_subs_3_filtered, variable = "SampleGroup", pair_id = "PairID")
+
+# Weź 20 najbardziej istotnych białek
+top20_fdr_3 <- ttest_results_3 %>%
+  arrange(Adjusted_pval) %>%
+  slice(1:20) %>%
+  pull(OlinkID)
+
+# Volcano plot
+olink_volcano_plot(p.val_tbl = ttest_results_3, olinkid_list = top20_fdr_3) +
+  scale_color_manual(values = c('turquoise3', 'red')) +
+  theme_minimal() +
+  labs(title = "Volcano plot: before vs 3 months after treatment", x = "Difference in NPX (Estimate)", y = "-log10(p-value)")
+```
