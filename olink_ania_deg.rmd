@@ -1,0 +1,810 @@
+---
+title: "Quick and easy pipeline for olink analysis of Ania Samples"
+subtitle: "With an emphasis on filtering and DEG"
+author:
+ - Anna Dobosz
+ - Maks Nęcki
+fontsize: 10 pt
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    df_print: paged
+    toc: true
+    number_sections: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+``` 
+
+
+# Importing libraries and starting file 
+
+```{r}
+library(openxlsx)
+library(dplyr)
+library(tidyr)
+library(limma)
+library(ggplot2)
+library(ggrepel)
+library(tibble)
+library(patchwork)
+library(knitr)
+library(gridExtra)
+library(plotly)
+library(MASS)
+
+
+
+df_tnf <- read.xlsx("Eksperyment_TNF_TGF.xlsx", sheet = "TNF")
+
+head(df_tnf, 10)
+
+```
+
+##  We see that upon inspection columns "Group_Name1..4" could be coalesced into one "Group_Name" column:
+
+```{r merging_groups}
+
+df_tnf <- df_tnf %>%
+  mutate(Group_Name = coalesce(Group_Name1,
+                               Group_Name2,
+                               Group_Name3,
+                               Group_Name4))
+
+```
+
+## Some of the columns are deemed to be not necessary for further analysis, we will remove them:
+
+```{r removing_unnecessary_columns}
+df_tnf <- df_tnf %>%
+  dplyr::select(-SampleType, -PlateID, -DataAnalysisRefID, -OlinkID, -AssayType, -Panel, -Block , -Normalization,
+  -SoftwareVersion, -SoftwareName, -PanelDataArchiveVersion, -PreProcessingVersion, -PreProcessingSoftware,
+  -InstrumentType, -Group_Name1, -Group_Name2, -Group_Name3, -Group_Name4)
+
+head(df_tnf, 10)
+```
+
+## Now let's see how many of left columns and rows passed AssayQC and SampleQC control:
+
+```{r assay_sample_qc}
+
+df_tnf_filtered <- df_tnf %>%
+  filter(AssayQC == "PASS", SampleQC == "PASS")
+
+
+cat("Rows before:", nrow(df_tnf), "\n")
+cat("Rows after :", nrow(df_tnf_filtered), "\n")
+
+
+df_tnf <- df_tnf_filtered
+
+```
+
+## We will look briefly at summary statistics of NPX column to see if the distribution seems skewed and if it is, maybe there's a problem with normalization:
+
+```{r}
+# Summary statistics for normalized protein expression
+summary(df_tnf$NPX)
+```
+
+## Very next thing is to see what is distribution of normalized protein expression across each sample:
+
+```{r, echo = FALSE}
+
+ggplot(df_tnf, aes(x = SampleID, y = NPX)) +
+  geom_boxplot() +
+  
+  labs(title = "distribution of grouped normalized protein expr across distinct samples") +
+  
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(hjust = 0.5),
+    
+    # RAMKA
+    panel.border = element_rect(color = "black", fill = NA)
+  )
+
+```
+
+Yeah, as we see - there are some samples with distribution of NPX closely resembling media NPX distributions
+
+
+# Principal Component Analysis
+
+## Calculating inter and between samples variation:
+
+```{r}
+
+# =========================
+# 1. Data preparation
+# =========================
+expr_mat <- df_tnf %>%
+  dplyr::select(SampleID, Assay, NPX) %>%
+  pivot_wider(names_from = Assay, values_from = NPX) %>%
+  column_to_rownames("SampleID") %>%
+  as.matrix()
+
+# =========================
+# 2. main PCA calculation
+# =========================
+pca <- prcomp(expr_mat, scale. = TRUE)
+
+# =========================
+# 3. Calculating scale of explained variance
+# =========================
+pca_var <- (pca$sdev^2) / sum(pca$sdev^2) * 100
+
+pc1_lab <- paste0("PC1 (", round(pca_var[1], 1), "%)")
+pc2_lab <- paste0("PC2 (", round(pca_var[2], 1), "%)")
+
+# =========================
+# 4. Summary of PCA
+# =========================
+pca_summary <- data.frame(
+  PC_index = seq_along(pca_var),
+  ExplainedVariance = pca_var,
+  CumulativeExplainedVariance = cumsum(pca_var)
+)
+
+# We create a string object: PC1, PC2, PC3, ..., PC25 
+pca_summary$Component <- paste0("PC", pca_summary$PC_index)
+
+# IMPORTANT: enforcement of the correct PC order
+pca_summary$Component <- factor(
+  pca_summary$Component,
+  levels = paste0("PC", sort(pca_summary$PC_index))
+)
+
+# =========================
+# 5. (optional) PCA dataframe for plotting
+# =========================
+pca_df <- data.frame(
+  SampleID = rownames(pca$x),
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2]
+)
+
+meta <- df_tnf %>%
+  dplyr::select(SampleID, Treatment, Group_Name, CellLine) %>%
+  distinct()
+
+pca_df <- merge(pca_df, meta, by = "SampleID")
+```
+
+## Plotting two-dimensional PCA plot:
+
+```{r 2dplot}
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Treatment)) +
+
+  # punkty
+  geom_point(size = 4, alpha = 0.85) +
+
+  # elipsy grup
+  stat_ellipse(type = "t", level = 0.95, linewidth = 0.8) +
+
+  # ramka jak w paperze
+  theme_classic() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold")
+  ) +
+
+  # opisy osi z %
+  labs(
+    title = "Principal Component Analysis of Protein Expression Profiles",
+    x = pc1_lab,
+    y = pc2_lab,
+    color = "Treatment"
+  ) +
+
+  # kolory (bardziej „paper-friendly”)
+  scale_color_manual(values = c(
+    "Medium" = "#4E79A7",
+    "TNF" = "#E15759",
+    "CTO" = "#59A14F"
+  ))
+
+```
+
+## Plotting three-dimensional interactive PCA plot:
+
+
+```{r}
+
+# =========================
+# 1. PCA DATA
+# =========================
+pca_3d <- data.frame(
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2],
+  PC3 = pca$x[,3],
+  SampleID = rownames(pca$x)
+)
+
+meta <- df_tnf %>%
+  dplyr::select(SampleID, Treatment, Group_Name, CellLine) %>%
+  distinct()
+
+pca_3d <- merge(pca_3d, meta, by = "SampleID")
+
+# =========================
+# 2. HOVER TEXT
+# =========================
+pca_3d$hover_text <- paste(
+  "Sample:", pca_3d$SampleID, "<br>",
+  "Treatment:", pca_3d$Treatment, "<br>",
+  "PC1:", round(pca_3d$PC1, 2), "<br>",
+  "PC2:", round(pca_3d$PC2, 2), "<br>",
+  "PC3:", round(pca_3d$PC3, 2)
+)
+
+# =========================
+# 3. ELIPSOID FUNCTION
+# =========================
+create_ellipsoid <- function(df, scale = 2, n = 30) {
+
+  cov_mat <- cov(df[, c("PC1", "PC2", "PC3")])
+  center <- colMeans(df[, c("PC1", "PC2", "PC3")])
+
+  eig <- eigen(cov_mat)
+
+  radii <- sqrt(eig$values) * scale
+  axes <- eig$vectors
+
+  u <- seq(0, 2*pi, length.out = n)
+  v <- seq(0, pi, length.out = n)
+
+  x <- outer(cos(u), sin(v))
+  y <- outer(sin(u), sin(v))
+  z <- outer(rep(1, length(u)), cos(v))
+
+  ellipsoid <- array(NA, dim = c(n, n, 3))
+
+  for (i in 1:n) {
+    for (j in 1:n) {
+      point <- c(x[i,j], y[i,j], z[i,j]) * radii
+      rotated <- axes %*% point
+      ellipsoid[i,j,] <- rotated + center
+    }
+  }
+
+  list(
+    x = ellipsoid[,,1],
+    y = ellipsoid[,,2],
+    z = ellipsoid[,,3]
+  )
+}
+
+# =========================
+# 4. GROUPS + COLORS
+# =========================
+groups <- split(pca_3d, pca_3d$Treatment)
+
+colors <- c(
+  "Medium" = "#004B95",
+  "TNF"    = "#38812F",
+  "CTO"    = "#A30000"
+)
+
+# =========================
+# 5. BUILD PLOT
+# =========================
+p <- plot_ly()
+
+for (g in names(groups)) {
+
+  df <- groups[[g]]
+
+  col_hex <- colors[g]
+
+  # 🔥 konwersja HEX -> RGBA (plotly lubi rgba)
+  col_rgb <- grDevices::col2rgb(col_hex)
+  col_rgba <- paste0(
+    "rgba(",
+    col_rgb[1], ",",
+    col_rgb[2], ",",
+    col_rgb[3], ",",
+    0.2, ")"
+  )
+
+  # 🔹 punkty
+  p <- add_markers(
+    p,
+    data = df,
+    x = ~PC1, y = ~PC2, z = ~PC3,
+    text = ~hover_text,
+    hoverinfo = "text",
+    name = g,
+    marker = list(size = 5, color = col_hex)
+  )
+
+  # 🔹 elipsoida
+  if (nrow(df) >= 3) {
+
+    ell <- create_ellipsoid(df)
+
+    p <- add_surface(
+      p,
+      x = ell$x,
+      y = ell$y,
+      z = ell$z,
+      opacity = 0.2,
+      showscale = FALSE,
+      surfacecolor = matrix(1, nrow = nrow(ell$x), ncol = ncol(ell$x)),
+      colorscale = list(c(0, col_rgba), c(1, col_rgba)),
+      inherit = FALSE
+    )
+  }
+}
+
+# =========================
+# 6. LAYOUT
+# =========================
+p %>% layout(
+  title = "3D PCA with Covariance Ellipsoids",
+  scene = list(
+    xaxis = list(title = "PC1"),
+    yaxis = list(title = "PC2"),
+    zaxis = list(title = "PC3")
+  )
+)
+
+```
+
+## PCA summary
+
+Let's look at the summary of PCA:
+
+```{r}
+
+pca_summary
+
+```
+
+## PCA - diagnostic plots
+
+Now we do Barplot of explained variances:
+
+```{r}
+
+plot_explained_variance <- ggplot(pca_summary, aes(x = Component)) +
+  
+  geom_bar(
+    aes(y = ExplainedVariance),
+    stat = "identity",
+    fill = "steelblue",
+    color = "black"
+  ) +
+  
+  geom_text(
+    aes(y = ExplainedVariance,
+        label = paste0(round(ExplainedVariance, 1), "%")),
+    vjust = -0.5,
+    size = 4
+  ) +
+  
+  ylim(0, 100) +
+  
+  labs(
+    title = "Explained Variance by Principal Component",
+    x = "Principal Component",
+    y = "Percentage Explained Variance"
+  ) +
+  
+  theme_minimal()
+
+```
+
+And cumulative variance plot:
+
+```{r}
+
+plot_cumulative_explained_variance <- ggplot(pca_summary, aes(x = Component)) +
+  
+  geom_line(aes(y = CumulativeExplainedVariance),
+            color = "orange",
+            linewidth = 1) +
+  
+  geom_point(aes(y = CumulativeExplainedVariance),
+             color = "orange",
+             size = 2) +
+  
+  geom_text(
+    aes(y = CumulativeExplainedVariance,
+        label = paste0(round(CumulativeExplainedVariance, 1), "%")),
+    vjust = -0.5,
+    size = 4
+  ) +
+  
+  ylim(0, 100) +
+  
+  labs(
+    title = "Cumulative Explained Variance",
+    x = "Principal Component",
+    y = "Cumulative Variance (%)"
+  ) +
+  
+  theme_minimal()
+
+
+```
+
+---
+
+*Explained Variance*
+
+Explained variance barplot tells you how much of the total information (variation) in the data is captured by each principal component.
+
+For example:
+
+- PC1 explains the largest amount of variation in your dataset
+- PC2 explains the next largest part, but independent from PC1 and so on
+
+So if PC1 explains 40%, it means:
+
+**this single axis already captures 40% of all differences between your samples**
+
+---
+
+*Cumulative Explained Variance*
+
+Cumulative explained variance shows how much total information is captured when you combine PCs step by step.
+
+For example:
+
+- PC1 → 40%
+- PC1 + PC2 → 65%
+- PC1 + PC2 + PC3 → 78%
+
+It answers the question:
+
+**How many components do I need to describe most of my data?**
+
+---
+
+## Explained variance barplot and cumulative graph:
+
+```{r, echo=FALSE}
+
+plot_explained_variance
+
+```
+
+```{r, echo=FALSE}
+
+plot_cumulative_explained_variance
+
+```
+
+
+# Protein Differential Expression
+
+## Running Differential Expression Analysis:      
+
+```{r differential expressed genes}
+
+# ==== 1. METADATA ====
+meta <- df_tnf %>%
+  dplyr::select(SampleID, Treatment) %>%
+  distinct()
+
+# ==== 2. EXPRESSION MATRIX (Assay = protein) ====
+expr <- df_tnf %>%
+  dplyr::select(SampleID, Assay, NPX) %>%
+  pivot_wider(names_from = Assay, values_from = NPX) %>%
+  column_to_rownames("SampleID") %>%
+  as.matrix()
+
+# ==== 3. ADJUSTING METADATA ====
+meta <- meta %>%
+  filter(SampleID %in% rownames(expr))
+
+meta <- meta[match(rownames(expr), meta$SampleID), ]
+
+# ==== 4. FACTOR (reference = Medium) ====
+meta$Treatment <- factor(meta$Treatment,
+                         levels = c("Medium", "TNF", "CTO"))
+
+# ==== 5. DESIGN MATRIX ====
+design <- model.matrix(~ Treatment, data = meta)
+
+# ==== 6. LIMMA ====
+fit <- lmFit(t(expr), design)   # <- important: transposition!
+fit <- eBayes(fit)
+
+contrast.matrix <- makeContrasts(
+  TNF_vs_Medium = TreatmentTNF,
+  CTO_vs_Medium = TreatmentCTO,
+  TNF_vs_CTO    = TreatmentTNF - TreatmentCTO,
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# ==== 7. RESULTS: TNF vs Medium ====
+res_TNF_vs_Medium <- topTable(fit2,
+                             coef = "TNF_vs_Medium",
+                             number = Inf,
+                             adjust.method = "BH")
+
+# ==== 8. RESULTS: CTO vs Medium ====
+res_CTO_vs_Medium <- topTable(fit2,
+                             coef = "CTO_vs_Medium",
+                             number = Inf,
+                             adjust.method = "BH")
+
+
+# ==== 9. RESULTS: TNF vs CTO ====
+res_TNF_vs_CTO <- topTable(fit2,
+                             coef = "TNF_vs_CTO",
+                             number = Inf,
+                             adjust.method = "BH")
+
+```
+
+
+## res_TNF_vs_Medium volcanoplot
+
+In this part I use res_TNF_vs_Medium dataframe as starting table to plot vulcanos:
+
+```{r plotting_1}
+
+# ==== CATEGORIZATION ====
+res_TNF_vs_Medium$status <- "Not significant"
+
+res_TNF_vs_Medium$status[
+  res_TNF_vs_Medium$adj.P.Val < 0.05 &
+  res_TNF_vs_Medium$logFC > 1
+] <- "Up-regulated"
+
+res_TNF_vs_Medium$status[
+  res_TNF_vs_Medium$adj.P.Val < 0.05 &
+  res_TNF_vs_Medium$logFC < -1
+] <- "Down-regulated"
+
+# ==== GENES TO LABEL ====
+label_genes <- res_TNF_vs_Medium[
+  res_TNF_vs_Medium$adj.P.Val < 0.01 &
+  abs(res_TNF_vs_Medium$logFC) > 5,
+]
+
+label_genes <- label_genes %>%
+  rownames_to_column("gene")
+
+# ==== VOLCANO ====
+p1 <- ggplot(res_TNF_vs_Medium,
+       aes(x = logFC, y = -log10(adj.P.Val))) +
+  
+  geom_point(aes(color = status), size = 2) +
+  
+  scale_color_manual(values = c(
+    "Not significant" = "grey",
+    "Up-regulated" = "red",
+    "Down-regulated" = "blue"
+  )) +
+  
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  
+  geom_text_repel(
+    data = label_genes,
+    aes(label = gene),
+    size = 3
+  ) +
+  
+  labs(
+    title = "Differential Protein Analysis (TNF - Medium)",
+    x = "log2FC",
+    y = "-log10(FDR)",
+    color = "Regulation"
+  ) +
+  
+  theme_classic() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+## res_CTO_vs_Medium volcanoplot
+
+And in this part I use res_CTO_vs_Medium dataframe as starting table to plot vulcanos
+
+```{r plotting_2}
+
+
+# ==== CATEGORIZATION ====
+res_CTO_vs_Medium$status <- "Not significant"
+
+res_CTO_vs_Medium$status[
+  res_CTO_vs_Medium$adj.P.Val < 0.05 &
+  res_CTO_vs_Medium$logFC > 1
+] <- "Up-regulated"
+
+res_CTO_vs_Medium$status[
+  res_CTO_vs_Medium$adj.P.Val < 0.05 &
+  res_CTO_vs_Medium$logFC < -1
+] <- "Down-regulated"
+
+# ==== GENES TO LABEL ====
+label_genes <- res_CTO_vs_Medium[
+  res_CTO_vs_Medium$adj.P.Val < 0.01 &
+  abs(res_CTO_vs_Medium$logFC) > 5,
+]
+
+label_genes <- label_genes %>%
+  rownames_to_column("gene")
+
+# ==== VOLCANO ====
+p2 <- ggplot(res_CTO_vs_Medium,
+       aes(x = logFC, y = -log10(adj.P.Val))) +
+  
+  geom_point(aes(color = status), size = 2) +
+  
+  scale_color_manual(values = c(
+    "Not significant" = "grey",
+    "Up-regulated" = "red",
+    "Down-regulated" = "blue"
+  )) +
+  
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  
+  geom_text_repel(
+    data = label_genes,
+    aes(label = gene),
+    size = 3
+  ) +
+  
+  labs(
+    title = "Differential Protein Analysis (CTO - Medium)",
+    x = "log2FC",
+    y = "-log10(FDR)",
+    color = "Regulation"
+  ) +
+  
+  theme_classic() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+## res_TNF_vs_Medium volcanoplot 
+
+And in this part I use res_TNF_vs_CTO dataframe as starting table to plot vulcanos
+
+```{r plotting_3}
+
+
+# ==== CATEGORIZATION ====
+res_TNF_vs_CTO$status <- "Not significant"
+
+res_TNF_vs_CTO$status[
+  res_TNF_vs_CTO$adj.P.Val < 0.05 &
+  res_TNF_vs_CTO$logFC > 1
+] <- "Up-regulated"
+
+res_TNF_vs_CTO$status[
+  res_TNF_vs_CTO$adj.P.Val < 0.05 &
+  res_TNF_vs_CTO$logFC < -1
+] <- "Down-regulated"
+
+# ==== GENES TO LABEL ====
+label_genes <- res_TNF_vs_CTO[
+  res_TNF_vs_CTO$adj.P.Val < 0.01 &
+  abs(res_TNF_vs_CTO$logFC) > 5,
+]
+
+label_genes <- label_genes %>%
+  rownames_to_column("gene")
+
+# ==== VOLCANO ====
+p3 <- ggplot(res_TNF_vs_CTO,
+       aes(x = logFC, y = -log10(adj.P.Val))) +
+  
+  geom_point(aes(color = status), size = 2) +
+  
+  scale_color_manual(values = c(
+    "Not significant" = "grey",
+    "Up-regulated" = "red",
+    "Down-regulated" = "blue"
+  )) +
+  
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  
+  geom_text_repel(
+    data = label_genes,
+    aes(label = gene),
+    size = 3
+  ) +
+  
+  labs(
+    title = "Differential Protein Analysis (TNF - CTO)",
+    x = "log2FC",
+    y = "-log10(FDR)",
+    color = "Regulation"
+  ) +
+  
+  theme_classic() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+
+
+# Visualizing volcano plots:
+
+## TNF vs Medium:
+
+```{r, echo = FALSE}
+
+p1 
+
+```
+
+## CTO vs Medium
+
+```{r, echo = FALSE}
+
+p2
+
+```
+
+## TNF vs CTO
+
+```{r, echo = FALSE}
+
+p3
+
+```
+
+## Printing summaries of up- and down- statistically significant proteins:
+
+```{r}
+
+reg_summary_fdr_TNF <- res_TNF_vs_Medium %>%
+  filter(status != "Not significant") %>%
+  group_by(status) %>%
+  summarise(n_genes = n()) %>%
+  arrange(status)
+
+knitr::kable(reg_summary_fdr_TNF, caption = "TNF vs Medium: FDR < 0.05 & |LFC| > 1")
+
+```
+
+```{r}
+
+reg_summary_fdr_CTO <- res_CTO_vs_Medium %>%
+  filter(status != "Not significant") %>%
+  group_by(status) %>%
+  summarise(n_genes = n()) %>%
+  arrange(status)
+
+knitr::kable(reg_summary_fdr_CTO, caption = "CTO vs Medium: FDR < 0.05 & |LFC| > 1")
+
+```
+
+```{r}
+
+reg_summary_fdr_TNF_vs_CTO <- res_TNF_vs_CTO %>%
+  filter(status != "Not significant") %>%
+  group_by(status) %>%
+  summarise(n_genes = n()) %>%
+  arrange(status)
+
+knitr::kable(reg_summary_fdr_TNF_vs_CTO, caption = "TNF vs CTO: FDR < 0.05 & |LFC| > 1")
+
+```
